@@ -54,7 +54,8 @@ impl TestDb {
             .await
             .expect("reconnect to drop the test database");
         admin
-            .execute(format!("DROP DATABASE IF EXISTS {}", self.name).as_str())
+            // A closed pool's backends can still be disconnecting, which a plain DROP refuses.
+            .execute(format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name).as_str())
             .await
             .expect("drop the test database");
     }
