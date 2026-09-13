@@ -309,20 +309,21 @@ struct QualityRows {
     recent: Vec<sqlx::postgres::PgRow>,
 }
 
-/// One indexer's probes over a window, attributed and judged as `load_probe_agg` and the QoS rollup
-/// in foghorn-probe do it, so the three surfaces on the page count the same answers as wrong.
+/// Every probe answer in the window, attributed and judged as `load_probe_agg` and the QoS rollup
+/// in foghorn-probe do it, so every surface on the page counts the same answers as wrong.
 /// `observation.indexer_address` is the signing key for a gateway probe and the indexer only for a
 /// paid one: matched directly, it found nothing but refused payments.
-const INDEXER_PROBES: &str = r#"
+const JUDGED_PROBES: &str = r#"
     WITH responders AS (
         SELECT o.probe_id, COUNT(*) FILTER (WHERE o.response_hash IS NOT NULL) AS n
         FROM observation o
         JOIN probe p ON p.id = o.probe_id
-        WHERE p.dispatched_at > NOW() - $2::interval
+        WHERE p.dispatched_at > NOW() - $1::interval
         GROUP BY o.probe_id
     ),
-    mine AS (
-        SELECT p.id AS probe_id, p.deployment_id, p.query_category, p.dispatched_at,
+    judged AS (
+        SELECT COALESCE(am.indexer_address, o.indexer_address) AS indexer_address,
+               p.id AS probe_id, p.deployment_id, p.query_category, p.dispatched_at,
                o.latency_ms, o.response_hash,
                COALESCE(
                    o.response_hash <> d.largest_by_count_hash
@@ -338,10 +339,9 @@ const INDEXER_PROBES: &str = r#"
         LEFT JOIN divergence d ON d.probe_id = o.probe_id
         LEFT JOIN responders r ON r.probe_id = o.probe_id
         LEFT JOIN nondeterministic_deployment nd ON nd.deployment_id = p.deployment_id
-        WHERE COALESCE(am.indexer_address, o.indexer_address) = $1
-          AND (am.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid')
+        WHERE (am.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid')
           AND (o.error_class IS NULL OR o.error_class NOT LIKE 'payment\_%')
-          AND p.dispatched_at > NOW() - $2::interval
+          AND p.dispatched_at > NOW() - $1::interval
     )"#;
 
 async fn quality_rows(
@@ -350,7 +350,7 @@ async fn quality_rows(
     interval: &str,
 ) -> sqlx::Result<QualityRows> {
     let sql = format!(
-        "{INDEXER_PROBES}
+        "{JUDGED_PROBES}
          SELECT
              COUNT(DISTINCT probe_id) FILTER (WHERE response_hash IS NOT NULL) AS total_probes,
              COUNT(DISTINCT probe_id) FILTER (WHERE fault) AS divergent_probes,
@@ -359,39 +359,42 @@ async fn quality_rows(
                  FILTER (WHERE response_hash IS NOT NULL) AS p50_latency,
              PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms)
                  FILTER (WHERE response_hash IS NOT NULL) AS p95_latency
-         FROM mine"
+         FROM judged
+         WHERE indexer_address = $2"
     );
     let summary = sqlx::query(&sql)
-        .bind(address)
         .bind(interval)
+        .bind(address)
         .fetch_one(pool)
         .await?;
 
     let sql = format!(
-        "{INDEXER_PROBES}
+        "{JUDGED_PROBES}
          SELECT deployment_id,
                 COUNT(DISTINCT probe_id) FILTER (WHERE response_hash IS NOT NULL) AS total_probes,
                 COUNT(DISTINCT probe_id) FILTER (WHERE fault) AS divergent_probes
-         FROM mine
+         FROM judged
+         WHERE indexer_address = $2
          GROUP BY deployment_id"
     );
     let by_deployment = sqlx::query(&sql)
-        .bind(address)
         .bind(interval)
+        .bind(address)
         .fetch_all(pool)
         .await?;
 
     let sql = format!(
-        "{INDEXER_PROBES}
+        "{JUDGED_PROBES}
          SELECT probe_id AS id, deployment_id, query_category, dispatched_at, response_hash,
                 fault AS divergent
-         FROM mine
+         FROM judged
+         WHERE indexer_address = $2
          ORDER BY dispatched_at DESC
          LIMIT 20"
     );
     let recent = sqlx::query(&sql)
-        .bind(address)
         .bind(interval)
+        .bind(address)
         .fetch_all(pool)
         .await?;
 
@@ -486,42 +489,13 @@ pub async fn deployment_quality(
     let days = params.days.unwrap_or(7);
     let interval = format!("{} days", days);
 
-    let by_indexer = sqlx::query(
-        r#"SELECT
-             o.indexer_address,
-             am.indexer_address as resolved_indexer,
-             am.indexer_url,
-             COUNT(DISTINCT o.probe_id) as total_probes,
-             COUNT(DISTINCT CASE WHEN d.cluster_count > 1 THEN o.probe_id END) as divergent_probes,
-             ROUND(AVG(o.latency_ms))::int as avg_latency_ms,
-             MAX(p.dispatched_at) as last_seen
-           FROM observation o
-           JOIN probe p ON p.id = o.probe_id
-           LEFT JOIN divergence d ON d.probe_id = o.probe_id
-           LEFT JOIN allocation_map am ON am.allocation_key = o.indexer_address
-           WHERE p.deployment_id = $1
-             AND p.dispatched_at > NOW() - $2::interval
-           GROUP BY o.indexer_address, am.indexer_address, am.indexer_url
-           ORDER BY total_probes DESC"#,
-    )
-    .bind(&deployment_id)
-    .bind(&interval)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let by_indexer = deployment_indexer_rows(&state.pool, &deployment_id, &interval)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let recent_divergences = sqlx::query(
-        r#"SELECT p.id, p.block_number, p.query_category, p.dispatched_at, d.cluster_count
-           FROM divergence d
-           JOIN probe p ON p.id = d.probe_id
-           WHERE p.deployment_id = $1
-           ORDER BY p.dispatched_at DESC
-           LIMIT 10"#,
-    )
-    .bind(&deployment_id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let recent_divergences = recent_divergence_rows(&state.pool, &deployment_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(json!({
         "deployment_id": deployment_id,
@@ -551,6 +525,53 @@ pub async fn deployment_quality(
             })
         }).collect::<Vec<_>>(),
     })))
+}
+
+async fn deployment_indexer_rows(
+    pool: &sqlx::PgPool,
+    deployment_id: &str,
+    interval: &str,
+) -> sqlx::Result<Vec<sqlx::postgres::PgRow>> {
+    let sql = format!(
+        "{JUDGED_PROBES}
+         SELECT indexer_address,
+                indexer_address AS resolved_indexer,
+                (SELECT max(a.indexer_url) FROM allocation_map a
+                 WHERE a.indexer_address = j.indexer_address) AS indexer_url,
+                COUNT(DISTINCT probe_id) FILTER (WHERE response_hash IS NOT NULL) AS total_probes,
+                COUNT(DISTINCT probe_id) FILTER (WHERE fault) AS divergent_probes,
+                ROUND(AVG(latency_ms) FILTER (WHERE response_hash IS NOT NULL))::int AS avg_latency_ms,
+                MAX(dispatched_at) AS last_seen
+         FROM judged j
+         WHERE deployment_id = $2
+         GROUP BY indexer_address
+         ORDER BY total_probes DESC"
+    );
+    sqlx::query(&sql)
+        .bind(interval)
+        .bind(deployment_id)
+        .fetch_all(pool)
+        .await
+}
+
+/// Probes whose answers actually differed. The scheduler also writes a `divergence` row when
+/// everyone agreed (`cluster_count = 1`), so the row alone is not a divergence.
+async fn recent_divergence_rows(
+    pool: &sqlx::PgPool,
+    deployment_id: &str,
+) -> sqlx::Result<Vec<sqlx::postgres::PgRow>> {
+    sqlx::query(
+        r#"SELECT p.id, p.block_number, p.query_category, p.dispatched_at, d.cluster_count
+           FROM divergence d
+           JOIN probe p ON p.id = d.probe_id
+           WHERE p.deployment_id = $1
+             AND d.cluster_count > 1
+           ORDER BY p.dispatched_at DESC
+           LIMIT 10"#,
+    )
+    .bind(deployment_id)
+    .fetch_all(pool)
+    .await
 }
 
 // ── Judgement layer ───────────────────────────────────────────────────────────
@@ -1754,6 +1775,66 @@ mod tests {
             .filter(|r| r.get::<bool, _>("divergent"))
             .count();
         assert_eq!(flagged as i64, expect::FAULTS);
+        db.drop_database().await;
+    }
+
+    #[tokio::test]
+    async fn deployment_quality_attributes_and_judges_like_the_indexer_view() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_disagreement(&db.pool, chrono::Utc::now() - chrono::Duration::minutes(10))
+            .await;
+
+        let rows = deployment_indexer_rows(&db.pool, testdb::DEPLOYMENT, "1 day")
+            .await
+            .unwrap();
+        let got: std::collections::BTreeMap<String, (i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("indexer_address"),
+                    (
+                        r.get::<i64, _>("total_probes"),
+                        r.get::<i64, _>("divergent_probes"),
+                    ),
+                )
+            })
+            .collect();
+
+        let want = std::collections::BTreeMap::from([
+            (
+                testdb::INDEXER.to_string(),
+                (expect::ANSWERED_ON_DEPLOYMENT, expect::FAULTS_ON_DEPLOYMENT),
+            ),
+            (testdb::PEER_J.to_string(), (3, 0)),
+            (testdb::PEER_L.to_string(), (2, 1)),
+            (testdb::PEER_PAID.to_string(), (1, 0)),
+        ]);
+        assert_eq!(got, want);
+
+        let agreed = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO probe (id, deployment_id, block_hash, block_number, query_hash, query_category, query_text, dispatched_at)
+             VALUES ($1, $2, '0xblock', 1000, '0xquery', 'Q_byid', '{}', NOW())",
+        )
+        .bind(agreed)
+        .bind(testdb::DEPLOYMENT)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO divergence (probe_id, cluster_count, largest_by_count_hash, largest_by_count_size, largest_by_stake_hash, largest_by_stake_weight)
+             VALUES ($1, 1, 'a', 3, 'a', 3.0)",
+        )
+        .bind(agreed)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let recent = recent_divergence_rows(&db.pool, testdb::DEPLOYMENT)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), 2, "agreement is not a divergence");
         db.drop_database().await;
     }
 }

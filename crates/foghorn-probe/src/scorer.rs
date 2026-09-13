@@ -317,6 +317,13 @@ async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
     .fetch_all(pool)
     .await?;
 
+    let flagged_before: HashSet<String> =
+        sqlx::query_scalar("SELECT deployment_id FROM nondeterministic_deployment")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+
     let mut ids: Vec<String> = Vec::new();
     for row in &rows {
         let dep: String = row.get("deployment_id");
@@ -350,6 +357,12 @@ async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
         .bind(&ids)
         .execute(pool)
         .await?;
+
+    // Buckets already rolled up judged these deployments' probes under the previous flag.
+    let flagged_now: HashSet<String> = ids.into_iter().collect();
+    for dep in flagged_before.symmetric_difference(&flagged_now) {
+        crate::qos::request_deployment_reroll(pool, dep, "non-deterministic flag changed").await?;
+    }
     Ok(())
 }
 
@@ -764,6 +777,37 @@ mod tests {
         );
         assert_eq!(agg[testdb::PEER_L].faults, 1);
         assert_eq!(agg[testdb::PEER_J].faults, 0);
+        db.drop_database().await;
+    }
+
+    #[tokio::test]
+    async fn a_deployment_found_nondeterministic_stops_counting_against_indexers() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_rotating_minority(&db.pool, Utc::now() - chrono::Duration::hours(2)).await;
+        let wide = foghorn_core::config::QosRollupConfig {
+            lookback_secs: 3 * 3600,
+            ..Default::default()
+        };
+        crate::qos::rollup_once(&wide, &db.pool).await.unwrap();
+        let divergent = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(sum(divergent_count), 0)::bigint FROM foghorn_qos WHERE deployment_id = $1",
+            )
+            .bind(testdb::ROTATING_DEPLOYMENT)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(divergent(db.pool.clone()).await, 4);
+
+        detect_nondeterministic(&db.pool).await.unwrap();
+        crate::qos::rollup_once(&Default::default(), &db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(divergent(db.pool.clone()).await, 0);
         db.drop_database().await;
     }
 }

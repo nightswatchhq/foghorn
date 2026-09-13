@@ -55,21 +55,91 @@ pub async fn run_qos_rollup_loop(cfg: QosRollupConfig, pool: PgPool) {
 /// "we did not check" can never be read as "verified correct". That distinction is the whole
 /// reason Foghorn's correctness signal is worth anything.
 pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
+    let from = chrono::Utc::now().timestamp() as f64 - cfg.lookback_secs as f64;
+    let mut rows = roll_range(cfg, pool, from, None, None).await?;
+
+    let requests: Vec<(i64, Option<String>, f64, f64)> = sqlx::query_as(
+        "SELECT id, deployment_id, extract(epoch FROM from_ts)::float8, extract(epoch FROM to_ts)::float8
+         FROM qos_reroll ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (id, deployment, from, to) in requests {
+        rows += roll_range(cfg, pool, from, Some(to), deployment.as_deref()).await?;
+        sqlx::query("DELETE FROM qos_reroll WHERE id = $1")
+            .bind(id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(rows)
+}
+
+/// Recompute every stored bucket from the observations, a day at a time. Idempotent, and safe
+/// beside the running loop: it upserts the rows a rollup would write from the same data.
+pub async fn reroll_all(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
+    const DAY: f64 = 86_400.0;
+    let first: Option<f64> =
+        sqlx::query_scalar("SELECT extract(epoch FROM min(dispatched_at))::float8 FROM probe")
+            .fetch_one(pool)
+            .await?;
+    let Some(first) = first else {
+        return Ok(0);
+    };
+    let now = chrono::Utc::now().timestamp() as f64;
+    let mut from = (first / DAY).floor() * DAY;
+    let mut rows = 0;
+    while from <= now {
+        rows += roll_range(cfg, pool, from, Some(from + DAY - 1.0), None).await?;
+        from += DAY;
+    }
+    Ok(rows)
+}
+
+/// Ask the rollup loop to recompute every bucket this deployment has, however old.
+pub(crate) async fn request_deployment_reroll(
+    pool: &PgPool,
+    deployment: &str,
+    reason: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO qos_reroll (deployment_id, from_ts, to_ts, reason)
+         SELECT $1, min(dispatched_at), max(dispatched_at), $2 FROM probe
+         WHERE deployment_id = $1
+         HAVING count(*) > 0",
+    )
+    .bind(deployment)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Recompute the buckets holding probes dispatched from `from` to `to` (open-ended when `None`),
+/// widened to whole buckets, for one deployment or all.
+async fn roll_range(
+    cfg: &QosRollupConfig,
+    pool: &PgPool,
+    from: f64,
+    to: Option<f64>,
+    deployment: Option<&str>,
+) -> Result<u64> {
     let bucket = cfg.bucket_secs as f64;
-    let lookback = cfg.lookback_secs as f64;
 
     let result = sqlx::query(
         r#"
-        WITH window_start AS (
-            -- On a bucket boundary. `NOW() - lookback` cut the oldest bucket in two, and the upsert
-            -- replaced its complete row with the half still inside the window.
-            SELECT to_timestamp(floor((extract(epoch FROM NOW()) - $2) / $1) * $1) AS at
+        WITH window_range AS (
+            -- On bucket boundaries. A bare `NOW() - lookback` cut the oldest bucket in two, and the
+            -- upsert replaced its complete row with the half still inside the window.
+            SELECT to_timestamp(floor($2 / $1) * $1) AS at,
+                   COALESCE(to_timestamp((floor($7::float8 / $1) + 1) * $1), 'infinity') AS until
         ),
         responders AS (
             SELECT o.probe_id, count(*) FILTER (WHERE o.response_hash IS NOT NULL) AS n
             FROM observation o
             JOIN probe p ON p.id = o.probe_id
-            WHERE p.dispatched_at >= (SELECT at FROM window_start)
+            WHERE p.dispatched_at >= (SELECT at FROM window_range)
+              AND p.dispatched_at < (SELECT until FROM window_range)
+              AND ($8::text IS NULL OR p.deployment_id = $8)
             GROUP BY o.probe_id
         ),
         obs AS (
@@ -134,7 +204,9 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
             LEFT JOIN divergence d ON d.probe_id = o.probe_id
             LEFT JOIN responders r ON r.probe_id = o.probe_id
             LEFT JOIN nondeterministic_deployment nd ON nd.deployment_id = p.deployment_id
-            WHERE p.dispatched_at >= (SELECT at FROM window_start)
+            WHERE p.dispatched_at >= (SELECT at FROM window_range)
+              AND p.dispatched_at < (SELECT until FROM window_range)
+              AND ($8::text IS NULL OR p.deployment_id = $8)
               AND (m.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid')
               -- A refused payment is a fact about OUR escrow, never about the indexer.
               --
@@ -261,11 +333,13 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
         "#,
     )
     .bind(bucket)
-    .bind(lookback)
+    .bind(from)
     .bind(cfg.bucket_secs as i32)
     .bind(&cfg.chain_id)
     .bind(&cfg.gateway_id)
     .bind(cfg.chainhead_offset as i64)
+    .bind(to)
+    .bind(deployment)
     .execute(pool)
     .await?;
 
@@ -349,6 +423,39 @@ mod tests {
         rollup_once(&cfg, &db.pool).await.unwrap();
 
         assert_eq!(bucket_totals(&db.pool).await[testdb::INDEXER].0, 2);
+        db.drop_database().await;
+    }
+
+    #[tokio::test]
+    async fn reroll_all_recomputes_every_stored_bucket_and_running_it_again_changes_nothing() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_disagreement(&db.pool, Utc::now() - ChronoDuration::days(3)).await;
+        sqlx::query(
+            "INSERT INTO foghorn_qos (indexer_address, deployment_id, bucket_start, bucket_secs, gateway_id,
+                                      query_count, num_indexer_200_responses, proportion_indexer_200_responses,
+                                      comparable_count, divergent_count)
+             SELECT $1, $2, to_timestamp(floor(extract(epoch FROM min(dispatched_at)) / 300) * 300), 300,
+                    'lodestar', 1, 1, 1.0, 1, 1
+             FROM probe",
+        )
+        .bind(testdb::INDEXER)
+        .bind(testdb::DEPLOYMENT)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let cfg = QosRollupConfig::default();
+        reroll_all(&cfg, &db.pool).await.unwrap();
+        let once = bucket_totals(&db.pool).await;
+        reroll_all(&cfg, &db.pool).await.unwrap();
+
+        assert_eq!(
+            once[testdb::INDEXER],
+            (expect::OBSERVATIONS, expect::FAULTS, expect::COMPARABLE)
+        );
+        assert_eq!(bucket_totals(&db.pool).await, once);
         db.drop_database().await;
     }
 }

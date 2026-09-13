@@ -1,8 +1,8 @@
 //! Throwaway databases for tests of the SQL that decides what Foghorn publishes.
 //!
 //! Each test gets its own database on the server named by `FOGHORN_TEST_DATABASE_URL`, migrated
-//! from scratch. Unset, the test says it was skipped and returns: it needs a real Postgres, and a
-//! machine without one has observed nothing to fail.
+//! from scratch. Unset on a workstation, the test says it was skipped and returns. Unset under CI,
+//! it fails: a suite that passes by observing nothing is the failure this project exists to catch.
 
 use chrono::{DateTime, Utc};
 use sqlx::{Connection, Executor, PgConnection, PgPool};
@@ -16,9 +16,16 @@ pub struct TestDb {
 
 impl TestDb {
     pub async fn create() -> Option<Self> {
-        let Ok(admin_url) = std::env::var("FOGHORN_TEST_DATABASE_URL") else {
-            eprintln!("FOGHORN_TEST_DATABASE_URL is unset; skipping a database test");
-            return None;
+        let admin_url = match database_url(
+            std::env::var("CI").ok().as_deref(),
+            std::env::var("FOGHORN_TEST_DATABASE_URL").ok(),
+        ) {
+            Ok(Some(url)) => url,
+            Ok(None) => {
+                eprintln!("FOGHORN_TEST_DATABASE_URL is unset; skipping a database test");
+                return None;
+            }
+            Err(e) => panic!("{e}"),
         };
         let name = format!("foghorn_test_{}", Uuid::new_v4().simple());
         let mut admin = PgConnection::connect(&admin_url)
@@ -53,6 +60,17 @@ impl TestDb {
     }
 }
 
+fn database_url(ci: Option<&str>, url: Option<String>) -> Result<Option<String>, String> {
+    match (url.filter(|u| !u.is_empty()), ci) {
+        (Some(url), _) => Ok(Some(url)),
+        (None, Some(ci)) if !ci.is_empty() && ci != "false" => Err(
+            "CI is set and FOGHORN_TEST_DATABASE_URL is not: the database tests would pass without running"
+                .to_string(),
+        ),
+        (None, _) => Ok(None),
+    }
+}
+
 fn with_database(url: &str, name: &str) -> String {
     let (base, query) = match url.split_once('?') {
         Some((b, q)) => (b, Some(q)),
@@ -72,10 +90,11 @@ pub const PEER_PAID: &str = "0x00000000000000000000000000000000000000a4";
 const KEY_INDEXER: &str = "0x00000000000000000000000000000000000000b1";
 const KEY_J: &str = "0x00000000000000000000000000000000000000b2";
 const KEY_L: &str = "0x00000000000000000000000000000000000000b3";
-const KEY_UNRESOLVED: &str = "0x00000000000000000000000000000000000000b9";
+pub const KEY_UNRESOLVED: &str = "0x00000000000000000000000000000000000000b9";
 
 pub const DEPLOYMENT: &str = "QmTestDeterministicDeploymentAAAAAAAAAAAAAAAAA";
 pub const NONDETERMINISTIC_DEPLOYMENT: &str = "QmTestNondeterministicDeploymentBBBBBBBBBBBBBB";
+pub const ROTATING_DEPLOYMENT: &str = "QmTestRotatingMinorityDeploymentCCCCCCCCCCCCCC";
 
 /// What [`seed_disagreement`] must produce for [`INDEXER`] under the one definition of a fault: an
 /// answer that differs from the largest cluster by count, when that cluster is more than half of
@@ -149,6 +168,30 @@ pub async fn seed_disagreement(pool: &PgPool, at: DateTime<Utc>) {
     answer(pool, p, KEY_UNRESOLVED, "a", 1.0, "gateway").await;
 }
 
+/// Four probes on [`ROTATING_DEPLOYMENT`], each with a clear majority and a minority of one that
+/// rotates across three indexers: the shape `detect_nondeterministic` flags.
+pub async fn seed_rotating_minority(pool: &PgPool, at: DateTime<Utc>) {
+    for (key, indexer) in [(KEY_INDEXER, INDEXER), (KEY_J, PEER_J), (KEY_L, PEER_L)] {
+        sqlx::query(
+            "INSERT INTO allocation_map (allocation_key, indexer_address) VALUES ($1, $2)
+             ON CONFLICT (allocation_key) DO NOTHING",
+        )
+        .bind(key)
+        .bind(indexer)
+        .execute(pool)
+        .await
+        .expect("seed allocation_map");
+    }
+    for minority in [KEY_INDEXER, KEY_J, KEY_L, KEY_INDEXER] {
+        let p = probe(pool, ROTATING_DEPLOYMENT, at).await;
+        for key in [KEY_INDEXER, KEY_J, KEY_L] {
+            let hash = if key == minority { "odd" } else { "even" };
+            answer(pool, p, key, hash, 1.0, "gateway").await;
+        }
+        divergence(pool, p, "even", 2, "even", 2.0).await;
+    }
+}
+
 /// One paid answer from [`INDEXER`] on its own probe, needing no attribution.
 pub async fn seed_answer(pool: &PgPool, at: DateTime<Utc>) {
     let p = probe(pool, DEPLOYMENT, at).await;
@@ -220,4 +263,21 @@ async fn divergence(
     .execute(pool)
     .await
     .expect("seed divergence");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::database_url;
+
+    #[test]
+    fn a_ci_run_without_a_database_fails_instead_of_skipping() {
+        assert!(database_url(Some("true"), None).is_err());
+        assert!(database_url(Some("1"), Some(String::new())).is_err());
+        assert_eq!(database_url(None, None), Ok(None));
+        assert_eq!(database_url(Some("false"), None), Ok(None));
+        assert_eq!(
+            database_url(Some("true"), Some("postgres://x/y".into())),
+            Ok(Some("postgres://x/y".into()))
+        );
+    }
 }

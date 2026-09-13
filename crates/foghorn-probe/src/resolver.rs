@@ -115,18 +115,12 @@ pub async fn resolve_allocation_keys(
                 let key = alloc.id.to_lowercase();
                 found.insert(key.clone());
 
-                sqlx::query(
-                    r#"INSERT INTO allocation_map (allocation_key, indexer_address, indexer_url, resolved_at)
-                       VALUES ($1, $2, $3, NOW())
-                       ON CONFLICT (allocation_key) DO UPDATE
-                       SET indexer_address = EXCLUDED.indexer_address,
-                           indexer_url     = EXCLUDED.indexer_url,
-                           resolved_at     = NOW()"#,
+                record_attribution(
+                    pool,
+                    &key,
+                    &alloc.indexer.id.to_lowercase(),
+                    alloc.indexer.url.as_deref(),
                 )
-                .bind(&key)
-                .bind(alloc.indexer.id.to_lowercase())
-                .bind(&alloc.indexer.url)
-                .execute(pool)
                 .await?;
             }
 
@@ -150,4 +144,82 @@ pub async fn resolve_allocation_keys(
     }
 
     Ok(())
+}
+
+/// Record who a signing key belongs to. When that changes, the buckets holding the key's
+/// observations are re-rolled: they may be days old by the time a NULL key is retried.
+pub(crate) async fn record_attribution(
+    pool: &PgPool,
+    key: &str,
+    indexer: &str,
+    url: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        r#"WITH prev AS (
+               SELECT indexer_address FROM allocation_map WHERE allocation_key = $1
+           ),
+           upsert AS (
+               INSERT INTO allocation_map (allocation_key, indexer_address, indexer_url, resolved_at)
+               VALUES ($1, $2, $3, NOW())
+               ON CONFLICT (allocation_key) DO UPDATE
+               SET indexer_address = EXCLUDED.indexer_address,
+                   indexer_url     = EXCLUDED.indexer_url,
+                   resolved_at     = NOW()
+           )
+           INSERT INTO qos_reroll (deployment_id, from_ts, to_ts, reason)
+           SELECT p.deployment_id, min(p.dispatched_at), max(p.dispatched_at), 'allocation key attributed'
+           FROM observation o
+           JOIN probe p ON p.id = o.probe_id
+           WHERE o.indexer_address = $1
+             AND (SELECT indexer_address FROM prev) IS DISTINCT FROM $2
+           GROUP BY p.deployment_id"#,
+    )
+    .bind(key)
+    .bind(indexer)
+    .bind(url)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use foghorn_core::config::QosRollupConfig;
+    use foghorn_core::testdb::{self, TestDb};
+
+    async fn queries_for(pool: &PgPool, indexer: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COALESCE(sum(query_count), 0)::bigint FROM foghorn_qos WHERE indexer_address = $1",
+        )
+        .bind(indexer)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_key_attributed_after_its_buckets_rolled_up_is_counted_in_them() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_disagreement(&db.pool, Utc::now() - ChronoDuration::hours(2)).await;
+        let wide = QosRollupConfig {
+            lookback_secs: 3 * 3600,
+            ..Default::default()
+        };
+        crate::qos::rollup_once(&wide, &db.pool).await.unwrap();
+        let before = queries_for(&db.pool, testdb::PEER_J).await;
+
+        record_attribution(&db.pool, testdb::KEY_UNRESOLVED, testdb::PEER_J, None)
+            .await
+            .unwrap();
+        crate::qos::rollup_once(&QosRollupConfig::default(), &db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(queries_for(&db.pool, testdb::PEER_J).await, before + 1);
+        db.drop_database().await;
+    }
 }
