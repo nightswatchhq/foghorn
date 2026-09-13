@@ -309,48 +309,20 @@ struct QualityRows {
     recent: Vec<sqlx::postgres::PgRow>,
 }
 
-/// Every probe answer in the window, attributed and judged as `load_probe_agg` and the QoS rollup
-/// in foghorn-probe do it, so every surface on the page counts the same answers as wrong.
-/// `observation.indexer_address` is the signing key for a gateway probe and the indexer only for a
-/// paid one: matched directly, it found nothing but refused payments.
-const JUDGED_PROBES: &str = r#"
-    WITH responders AS (
-        SELECT o.probe_id, COUNT(*) FILTER (WHERE o.response_hash IS NOT NULL) AS n
-        FROM observation o
-        JOIN probe p ON p.id = o.probe_id
-        WHERE p.dispatched_at > NOW() - $1::interval
-        GROUP BY o.probe_id
-    ),
-    judged AS (
-        SELECT COALESCE(am.indexer_address, o.indexer_address) AS indexer_address,
-               p.id AS probe_id, p.deployment_id, p.query_category, p.dispatched_at,
-               o.latency_ms, o.response_hash,
-               COALESCE(
-                   o.response_hash <> d.largest_by_count_hash
-                   AND d.largest_by_count_size * 2 > r.n
-                   AND nd.deployment_id IS NULL,
-                   false
-               ) AS fault
-        FROM observation o
-        JOIN probe p ON p.id = o.probe_id
-        LEFT JOIN allocation_map am
-          ON am.allocation_key = o.indexer_address
-         AND am.indexer_address IS NOT NULL
-        LEFT JOIN divergence d ON d.probe_id = o.probe_id
-        LEFT JOIN responders r ON r.probe_id = o.probe_id
-        LEFT JOIN nondeterministic_deployment nd ON nd.deployment_id = p.deployment_id
-        WHERE (am.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid')
-          AND (o.error_class IS NULL OR o.error_class NOT LIKE 'payment\_%')
-          AND p.dispatched_at > NOW() - $1::interval
-    )"#;
+/// Probes in the window, judged exactly as the scorer, the rollup and the non-deterministic
+/// detector judge them.
+fn judged_in_window() -> String {
+    foghorn_core::judged::judged_probes("NOW() - $1::interval", true)
+}
 
 async fn quality_rows(
     pool: &sqlx::PgPool,
     address: &str,
     interval: &str,
 ) -> sqlx::Result<QualityRows> {
+    let judged = judged_in_window();
     let sql = format!(
-        "{JUDGED_PROBES}
+        "{judged}
          SELECT
              COUNT(DISTINCT probe_id) FILTER (WHERE response_hash IS NOT NULL) AS total_probes,
              COUNT(DISTINCT probe_id) FILTER (WHERE fault) AS divergent_probes,
@@ -369,7 +341,7 @@ async fn quality_rows(
         .await?;
 
     let sql = format!(
-        "{JUDGED_PROBES}
+        "{judged}
          SELECT deployment_id,
                 COUNT(DISTINCT probe_id) FILTER (WHERE response_hash IS NOT NULL) AS total_probes,
                 COUNT(DISTINCT probe_id) FILTER (WHERE fault) AS divergent_probes
@@ -384,7 +356,7 @@ async fn quality_rows(
         .await?;
 
     let sql = format!(
-        "{JUDGED_PROBES}
+        "{judged}
          SELECT probe_id AS id, deployment_id, query_category, dispatched_at, response_hash,
                 fault AS divergent
          FROM judged
@@ -532,8 +504,9 @@ async fn deployment_indexer_rows(
     deployment_id: &str,
     interval: &str,
 ) -> sqlx::Result<Vec<sqlx::postgres::PgRow>> {
+    let judged = judged_in_window();
     let sql = format!(
-        "{JUDGED_PROBES}
+        "{judged}
          SELECT indexer_address,
                 indexer_address AS resolved_indexer,
                 (SELECT max(a.indexer_url) FROM allocation_map a

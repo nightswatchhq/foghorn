@@ -87,14 +87,17 @@ pub const INDEXER: &str = "0x00000000000000000000000000000000000000a1";
 pub const PEER_J: &str = "0x00000000000000000000000000000000000000a2";
 pub const PEER_L: &str = "0x00000000000000000000000000000000000000a3";
 pub const PEER_PAID: &str = "0x00000000000000000000000000000000000000a4";
-const KEY_INDEXER: &str = "0x00000000000000000000000000000000000000b1";
+pub const KEY_INDEXER: &str = "0x00000000000000000000000000000000000000b1";
 const KEY_J: &str = "0x00000000000000000000000000000000000000b2";
 const KEY_L: &str = "0x00000000000000000000000000000000000000b3";
 pub const KEY_UNRESOLVED: &str = "0x00000000000000000000000000000000000000b9";
+const KEY_UNRESOLVED_2: &str = "0x00000000000000000000000000000000000000b8";
+const KEY_UNRESOLVED_3: &str = "0x00000000000000000000000000000000000000b7";
 
 pub const DEPLOYMENT: &str = "QmTestDeterministicDeploymentAAAAAAAAAAAAAAAAA";
 pub const NONDETERMINISTIC_DEPLOYMENT: &str = "QmTestNondeterministicDeploymentBBBBBBBBBBBBBB";
 pub const ROTATING_DEPLOYMENT: &str = "QmTestRotatingMinorityDeploymentCCCCCCCCCCCCCC";
+pub const UNATTRIBUTED_DEPLOYMENT: &str = "QmTestUnattributedRotationDeploymentDDDDDDDDDD";
 
 /// What [`seed_disagreement`] must produce for [`INDEXER`] under the one definition of a fault: an
 /// answer that differs from the largest cluster by count, when that cluster is more than half of
@@ -188,6 +191,42 @@ pub async fn seed_rotating_minority(pool: &PgPool, at: DateTime<Utc>) {
             let hash = if key == minority { "odd" } else { "even" };
             answer(pool, p, key, hash, 1.0, "gateway").await;
         }
+        divergence(pool, p, "even", 2, "even", 2.0).await;
+    }
+}
+
+/// Four probes on [`UNATTRIBUTED_DEPLOYMENT`] where two attributed indexers always agree, the
+/// minority rotates across signing keys nobody could attribute, and a payment is refused beside
+/// them. None of it is evidence the rest of Foghorn accepts.
+pub async fn seed_unattributed_rotation(pool: &PgPool, at: DateTime<Utc>) {
+    for (key, indexer) in [
+        (KEY_INDEXER, Some(INDEXER)),
+        (KEY_J, Some(PEER_J)),
+        (KEY_UNRESOLVED, None),
+        (KEY_UNRESOLVED_2, None),
+        (KEY_UNRESOLVED_3, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO allocation_map (allocation_key, indexer_address) VALUES ($1, $2)
+             ON CONFLICT (allocation_key) DO NOTHING",
+        )
+        .bind(key)
+        .bind(indexer)
+        .execute(pool)
+        .await
+        .expect("seed allocation_map");
+    }
+    for stray in [
+        KEY_UNRESOLVED,
+        KEY_UNRESOLVED_2,
+        KEY_UNRESOLVED_3,
+        KEY_UNRESOLVED,
+    ] {
+        let p = probe(pool, UNATTRIBUTED_DEPLOYMENT, at).await;
+        answer(pool, p, KEY_INDEXER, "even", 1.0, "gateway").await;
+        answer(pool, p, KEY_J, "even", 1.0, "gateway").await;
+        answer(pool, p, stray, "odd", 1.0, "gateway").await;
+        failure(pool, p, PEER_L, "payment_denylisted", 402, "paid").await;
         divergence(pool, p, "even", 2, "even", 2.0).await;
     }
 }

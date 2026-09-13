@@ -175,8 +175,9 @@ computed, recompute every stored bucket once:
 docker compose run --rm probe foghorn-probe reroll-qos
 ```
 
-It works a day at a time and upserts the same rows the rollup loop writes, so it is idempotent and
-safe to run while the probe service is up. Buckets touched by a late allocation-key attribution, or
+It works a day at a time and leaves exactly the rows a fresh rollup over the stored observations
+would write, deleting any it would not, so it is idempotent and safe to run while the probe service
+is up. Rows at a different bucket width are a separate series and are left alone. Buckets touched by a late allocation-key attribution, or
 by a deployment joining or leaving the non-deterministic list, are re-rolled by the loop itself.
 
 ---

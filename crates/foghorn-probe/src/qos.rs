@@ -74,8 +74,8 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
     Ok(rows)
 }
 
-/// Recompute every stored bucket from the observations, a day at a time. Idempotent, and safe
-/// beside the running loop: it upserts the rows a rollup would write from the same data.
+/// Recompute every stored bucket from the observations, a day at a time, leaving exactly the rows a
+/// fresh rollup would write. Idempotent, and safe beside the running loop.
 pub async fn reroll_all(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
     const DAY: f64 = 86_400.0;
     let first: Option<f64> =
@@ -114,8 +114,8 @@ pub(crate) async fn request_deployment_reroll(
     Ok(())
 }
 
-/// Recompute the buckets holding probes dispatched from `from` to `to` (open-ended when `None`),
-/// widened to whole buckets, for one deployment or all.
+/// Make the buckets from `from` to `to` (open-ended when `None`), widened to whole buckets, for one
+/// deployment or all, exactly what a rollup over their observations produces.
 async fn roll_range(
     cfg: &QosRollupConfig,
     pool: &PgPool,
@@ -271,6 +271,22 @@ async fn roll_range(
               AND indexer_url IS NOT NULL
               AND indexer_url <> ''
             GROUP BY 1
+        ),
+        -- Rows a rollup over this range would not write: an identity that no longer resolves there,
+        -- or a bucket with nothing left to count. Rows at another bucket width are another series.
+        stale AS (
+            DELETE FROM foghorn_qos q
+            USING window_range w
+            WHERE q.bucket_secs = $3
+              AND q.bucket_start >= w.at
+              AND q.bucket_start < w.until
+              AND ($8::text IS NULL OR q.deployment_id = $8)
+              AND NOT EXISTS (
+                  SELECT 1 FROM agg a
+                  WHERE a.indexer_address = q.indexer_address
+                    AND a.deployment_id = q.deployment_id
+                    AND a.bucket_start = q.bucket_start
+              )
         )
         INSERT INTO foghorn_qos (
             indexer_address, deployment_id, bucket_start, bucket_secs,
@@ -456,6 +472,57 @@ mod tests {
             (expect::OBSERVATIONS, expect::FAULTS, expect::COMPARABLE)
         );
         assert_eq!(bucket_totals(&db.pool).await, once);
+        db.drop_database().await;
+    }
+
+    async fn buckets(pool: &PgPool, bucket_secs: i32) -> Vec<(String, String, i64, i64, i64, i64)> {
+        sqlx::query_as(
+            "SELECT indexer_address, deployment_id, extract(epoch FROM bucket_start)::bigint,
+                    query_count, divergent_count, comparable_count
+             FROM foghorn_qos WHERE bucket_secs = $1 ORDER BY 1, 2, 3",
+        )
+        .bind(bucket_secs)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reroll_leaves_exactly_the_rows_a_fresh_rollup_would_write() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_disagreement(&db.pool, Utc::now() - ChronoDuration::days(3)).await;
+        let cfg = QosRollupConfig::default();
+        reroll_all(&cfg, &db.pool).await.unwrap();
+        let fresh = buckets(&db.pool, 300).await;
+
+        // Keyed by a signing key; in a bucket nothing was observed in; and a 600-second series,
+        // which the current cadence never writes and has no business deleting.
+        for (indexer, offset, secs) in [
+            (testdb::KEY_INDEXER, "0 hours", 300),
+            (testdb::INDEXER, "1 hour", 300),
+            (testdb::INDEXER, "0 hours", 600),
+        ] {
+            sqlx::query(
+                "INSERT INTO foghorn_qos (indexer_address, deployment_id, bucket_start, bucket_secs, gateway_id,
+                                          query_count, num_indexer_200_responses, proportion_indexer_200_responses)
+                 SELECT $1, $2, min(bucket_start) + $3::interval, $4, 'lodestar', 7, 7, 1.0 FROM foghorn_qos",
+            )
+            .bind(indexer)
+            .bind(testdb::DEPLOYMENT)
+            .bind(offset)
+            .bind(secs)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        reroll_all(&cfg, &db.pool).await.unwrap();
+        assert_eq!(buckets(&db.pool, 300).await, fresh);
+        reroll_all(&cfg, &db.pool).await.unwrap();
+        assert_eq!(buckets(&db.pool, 300).await, fresh);
+        assert_eq!(buckets(&db.pool, 600).await.len(), 1);
         db.drop_database().await;
     }
 }
