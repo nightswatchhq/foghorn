@@ -16,11 +16,11 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Default, Clone)]
-struct ProbeAgg {
-    probes_answered: i64,
-    faults: i64,
-    errors: i64,
-    total: i64,
+pub(crate) struct ProbeAgg {
+    pub(crate) probes_answered: i64,
+    pub(crate) faults: i64,
+    pub(crate) errors: i64,
+    pub(crate) total: i64,
 }
 
 #[derive(Default, Clone)]
@@ -183,7 +183,10 @@ fn assemble(
 
 // ── Loaders ───────────────────────────────────────────────────────────────────
 
-async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String, ProbeAgg>> {
+pub(crate) async fn load_probe_agg(
+    pool: &PgPool,
+    interval: &str,
+) -> Result<HashMap<String, ProbeAgg>> {
     // Aggregate Foghorn probe outcomes by REAL indexer address (resolved through
     // allocation_map from the recovered allocation signing key). A "fault" =
     // this indexer's response differed from the majority cluster on a divergent
@@ -728,4 +731,39 @@ async fn load_measured_lag(pool: &PgPool) -> Result<HashMap<String, f64>> {
             r.get::<Option<f64>, _>("lag").map(|l| (addr, l))
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use foghorn_core::testdb::{self, expect, TestDb};
+
+    #[tokio::test]
+    async fn the_probe_aggregate_resolves_identity_and_ignores_refused_payments() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_disagreement(&db.pool, Utc::now() - chrono::Duration::minutes(10)).await;
+
+        let agg = load_probe_agg(&db.pool, "1 hour").await.unwrap();
+
+        let indexer = &agg[testdb::INDEXER];
+        assert_eq!(
+            (
+                indexer.total,
+                indexer.probes_answered,
+                indexer.errors,
+                indexer.faults
+            ),
+            (
+                expect::OBSERVATIONS,
+                expect::ANSWERED,
+                expect::ERRORS,
+                expect::FAULTS
+            )
+        );
+        assert_eq!(agg[testdb::PEER_L].faults, 1);
+        assert_eq!(agg[testdb::PEER_J].faults, 0);
+        db.drop_database().await;
+    }
 }

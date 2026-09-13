@@ -60,7 +60,19 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
 
     let result = sqlx::query(
         r#"
-        WITH obs AS (
+        WITH window_start AS (
+            -- On a bucket boundary. `NOW() - lookback` cut the oldest bucket in two, and the upsert
+            -- replaced its complete row with the half still inside the window.
+            SELECT to_timestamp(floor((extract(epoch FROM NOW()) - $2) / $1) * $1) AS at
+        ),
+        responders AS (
+            SELECT o.probe_id, count(*) FILTER (WHERE o.response_hash IS NOT NULL) AS n
+            FROM observation o
+            JOIN probe p ON p.id = o.probe_id
+            WHERE p.dispatched_at >= (SELECT at FROM window_start)
+            GROUP BY o.probe_id
+        ),
+        obs AS (
             SELECT
                 -- `observation.indexer_address` is the ALLOCATION SIGNING KEY recovered from the
                 -- gateway's EIP-712 attestation, not the indexer. Publishing QoS keyed on it
@@ -90,11 +102,10 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                 o.latency_ms,
                 (o.error_class IS NULL AND o.http_status = 200) AS ok,
                 o.response_hash,
-                d.largest_by_stake_hash,
-                -- How many indexers agreed on the majority answer for this probe. A "majority" of
-                -- one is not a majority, and judging against it is what produced a public claim
-                -- that a named indexer served wrong data on a sample where nothing was compared.
-                d.largest_by_count_size AS majority_size,
+                -- The majority `scorer::load_probe_agg` grades by, so the feed and the grade cannot
+                -- name different indexers as serving wrong data.
+                d.largest_by_count_hash AS majority_hash,
+                COALESCE(d.largest_by_count_size * 2 > r.n, false) AS clear_majority,
                 -- Chainhead lag, derived from data we already collect. `freshness_sample` exists in
                 -- the schema but NOTHING in the codebase ever inserted into it, so this column was
                 -- null on every row while the page advertised it as one of two trustworthy fields.
@@ -121,8 +132,9 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
               ON m.allocation_key = o.indexer_address
              AND m.indexer_address IS NOT NULL
             LEFT JOIN divergence d ON d.probe_id = o.probe_id
+            LEFT JOIN responders r ON r.probe_id = o.probe_id
             LEFT JOIN nondeterministic_deployment nd ON nd.deployment_id = p.deployment_id
-            WHERE p.dispatched_at >= NOW() - make_interval(secs => $2)
+            WHERE p.dispatched_at >= (SELECT at FROM window_start)
               AND (m.indexer_address IS NOT NULL OR o.dispatch_mode = 'paid')
               -- A refused payment is a fact about OUR escrow, never about the indexer.
               --
@@ -166,16 +178,14 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
                 max(blocks_behind)                           AS max_blocks_behind,
                 count(*) FILTER (
                     WHERE response_hash IS NOT NULL
-                      AND largest_by_stake_hash IS NOT NULL
-                      AND COALESCE(majority_size, 0) >= 2
+                      AND clear_majority
                       AND NOT nondeterministic
                 )                                            AS comparable_count,
                 count(*) FILTER (
                     WHERE response_hash IS NOT NULL
-                      AND largest_by_stake_hash IS NOT NULL
-                      AND COALESCE(majority_size, 0) >= 2
+                      AND clear_majority
                       AND NOT nondeterministic
-                      AND response_hash <> largest_by_stake_hash
+                      AND response_hash <> majority_hash
                 )                                            AS divergent_count
             FROM obs
             GROUP BY 1, 2, 3
@@ -260,4 +270,85 @@ pub async fn rollup_once(cfg: &QosRollupConfig, pool: &PgPool) -> Result<u64> {
     .await?;
 
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use foghorn_core::testdb::{self, expect, TestDb};
+    use sqlx::Row;
+    use std::collections::HashMap;
+
+    async fn bucket_totals(pool: &PgPool) -> HashMap<String, (i64, i64, i64)> {
+        sqlx::query(
+            "SELECT indexer_address, sum(query_count)::bigint AS q,
+                    sum(divergent_count)::bigint AS d, sum(comparable_count)::bigint AS c
+             FROM foghorn_qos GROUP BY 1",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("indexer_address"),
+                (
+                    r.get::<i64, _>("q"),
+                    r.get::<i64, _>("d"),
+                    r.get::<i64, _>("c"),
+                ),
+            )
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn the_feed_and_the_grades_agree_on_who_served_wrong_data() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_disagreement(&db.pool, Utc::now() - ChronoDuration::minutes(10)).await;
+
+        rollup_once(&QosRollupConfig::default(), &db.pool)
+            .await
+            .unwrap();
+        let feed = bucket_totals(&db.pool).await;
+        let graded = crate::scorer::load_probe_agg(&db.pool, "1 hour")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            feed[testdb::INDEXER],
+            (expect::OBSERVATIONS, expect::FAULTS, expect::COMPARABLE)
+        );
+        for (indexer, agg) in &graded {
+            let (observations, faults, _) = feed.get(indexer).copied().unwrap_or_default();
+            assert_eq!((observations, faults), (agg.total, agg.faults), "{indexer}");
+        }
+        db.drop_database().await;
+    }
+
+    #[tokio::test]
+    async fn a_bucket_cut_by_the_lookback_edge_is_still_counted_whole() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        let bucket = QosRollupConfig::default().bucket_secs as i64;
+        let now = Utc::now().timestamp();
+        let edge = (now - 3600).div_euclid(bucket) * bucket + bucket / 2;
+        for offset in [-60, 60] {
+            let at = DateTime::from_timestamp(edge + offset, 0).unwrap();
+            testdb::seed_answer(&db.pool, at).await;
+        }
+        let cfg = QosRollupConfig {
+            lookback_secs: (now - edge) as u64,
+            ..Default::default()
+        };
+
+        rollup_once(&cfg, &db.pool).await.unwrap();
+
+        assert_eq!(bucket_totals(&db.pool).await[testdb::INDEXER].0, 2);
+        db.drop_database().await;
+    }
 }

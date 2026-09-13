@@ -21,3 +21,6 @@ tower-http = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 async-graphql = { workspace = true }
+
+[dev-dependencies]
+foghorn-core = { path = "../foghorn-core", features = ["test-db"] }
