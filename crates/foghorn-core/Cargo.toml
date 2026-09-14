@@ -3,6 +3,9 @@ name = "foghorn-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+test-db = []
+
 [dependencies]
 tokio = { workspace = true }
 sqlx = { workspace = true }

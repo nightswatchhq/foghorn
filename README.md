@@ -166,6 +166,20 @@ docker compose up -d
 The API listens on port 8080 inside the container (mapped to 8082 in the provided
 `docker-compose.yml`).
 
+### Recomputing the QoS buckets
+
+`foghorn_qos` is derived from stored observations. After a deploy that changes how buckets are
+computed, recompute every stored bucket once:
+
+```bash
+docker compose run --rm probe foghorn-probe reroll-qos
+```
+
+It works a day at a time and leaves exactly the rows a fresh rollup over the stored observations
+would write, deleting any it would not, so it is idempotent and safe to run while the probe service
+is up. Rows at a different bucket width are a separate series and are left alone. Buckets touched by a late allocation-key attribution, or
+by a deployment joining or leaving the non-deterministic list, are re-rolled by the loop itself.
+
 ---
 
 ## Test sets

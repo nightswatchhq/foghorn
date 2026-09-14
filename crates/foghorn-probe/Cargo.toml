@@ -26,3 +26,6 @@ json-patch = { workspace = true }
 serde_yaml = "0.9"
 k256 = { workspace = true }
 sha3 = { workspace = true }
+
+[dev-dependencies]
+foghorn-core = { path = "../foghorn-core", features = ["test-db"] }

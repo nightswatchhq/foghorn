@@ -16,11 +16,11 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Default, Clone)]
-struct ProbeAgg {
-    probes_answered: i64,
-    faults: i64,
-    errors: i64,
-    total: i64,
+pub(crate) struct ProbeAgg {
+    pub(crate) probes_answered: i64,
+    pub(crate) faults: i64,
+    pub(crate) errors: i64,
+    pub(crate) total: i64,
 }
 
 #[derive(Default, Clone)]
@@ -183,7 +183,10 @@ fn assemble(
 
 // ── Loaders ───────────────────────────────────────────────────────────────────
 
-async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String, ProbeAgg>> {
+pub(crate) async fn load_probe_agg(
+    pool: &PgPool,
+    interval: &str,
+) -> Result<HashMap<String, ProbeAgg>> {
     // Aggregate Foghorn probe outcomes by REAL indexer address (resolved through
     // allocation_map from the recovered allocation signing key). A "fault" =
     // this indexer's response differed from the majority cluster on a divergent
@@ -270,18 +273,14 @@ async fn load_probe_agg(pool: &PgPool, interval: &str) -> Result<HashMap<String,
 /// for 40% of minority positions (non-deterministic), while `QmasYjypV…` had one accounting for 83%
 /// (an indexer). A rate threshold ranks those identically; concentration separates them cleanly.
 async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
-    let rows = sqlx::query(
-        r#"WITH minority AS (
-               SELECT p.deployment_id,
-                      COALESCE(m.indexer_address, o.indexer_address) AS ix,
-                      COUNT(*) AS times
-               FROM observation o
-               JOIN probe p ON p.id = o.probe_id
-               JOIN divergence d ON d.probe_id = o.probe_id AND d.cluster_count > 1
-               LEFT JOIN allocation_map m ON m.allocation_key = o.indexer_address
-               WHERE o.response_hash IS NOT NULL
-                 AND o.response_hash <> d.largest_by_count_hash
-                 AND p.dispatched_at > NOW() - INTERVAL '7 days'
+    // Judged like every other surface, so a deployment is only excused on evidence Foghorn would
+    // otherwise count against an indexer. A no-majority scatter faults nobody, so it needs no excuse.
+    let sql = format!(
+        "{}
+         , minority AS (
+               SELECT deployment_id, indexer_address AS ix, COUNT(DISTINCT probe_id) AS times
+               FROM judged
+               WHERE fault
                GROUP BY 1, 2
            ),
            spread AS (
@@ -292,12 +291,11 @@ async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
                FROM minority GROUP BY 1
            ),
            totals AS (
-               SELECT p.deployment_id,
-                      COUNT(DISTINCT p.id)::int                        AS total,
-                      COUNT(DISTINCT d.probe_id)::int                  AS divergent
-               FROM probe p
-               LEFT JOIN divergence d ON d.probe_id = p.id AND d.cluster_count > 1
-               WHERE p.dispatched_at > NOW() - INTERVAL '7 days'
+               SELECT deployment_id,
+                      COUNT(DISTINCT probe_id)::int                           AS total,
+                      (COUNT(DISTINCT probe_id) FILTER (WHERE fault))::int    AS divergent
+               FROM judged
+               WHERE response_hash IS NOT NULL
                GROUP BY 1
            )
            SELECT t.deployment_id, t.total, t.divergent
@@ -309,10 +307,17 @@ async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
              -- And it must actually rotate. One indexer holding most of the minority positions is an
              -- indexer problem, and flagging the deployment would excuse it.
              AND s.minority_indexers >= 2
-             AND s.concentration <= 0.6"#,
-    )
-    .fetch_all(pool)
-    .await?;
+             AND s.concentration <= 0.6",
+        foghorn_core::judged::judged_probes("NOW() - INTERVAL '7 days'", false)
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+
+    let flagged_before: HashSet<String> =
+        sqlx::query_scalar("SELECT deployment_id FROM nondeterministic_deployment")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
 
     let mut ids: Vec<String> = Vec::new();
     for row in &rows {
@@ -347,6 +352,12 @@ async fn detect_nondeterministic(pool: &PgPool) -> Result<()> {
         .bind(&ids)
         .execute(pool)
         .await?;
+
+    // Buckets already rolled up judged these deployments' probes under the previous flag.
+    let flagged_now: HashSet<String> = ids.into_iter().collect();
+    for dep in flagged_before.symmetric_difference(&flagged_now) {
+        crate::qos::request_deployment_reroll(pool, dep, "non-deterministic flag changed").await?;
+    }
     Ok(())
 }
 
@@ -728,4 +739,129 @@ async fn load_measured_lag(pool: &PgPool) -> Result<HashMap<String, f64>> {
             r.get::<Option<f64>, _>("lag").map(|l| (addr, l))
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use foghorn_core::testdb::{self, expect, TestDb};
+
+    #[tokio::test]
+    async fn the_probe_aggregate_resolves_identity_and_ignores_refused_payments() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_disagreement(&db.pool, Utc::now() - chrono::Duration::minutes(10)).await;
+
+        let agg = load_probe_agg(&db.pool, "1 hour").await.unwrap();
+
+        let indexer = &agg[testdb::INDEXER];
+        assert_eq!(
+            (
+                indexer.total,
+                indexer.probes_answered,
+                indexer.errors,
+                indexer.faults
+            ),
+            (
+                expect::OBSERVATIONS,
+                expect::ANSWERED,
+                expect::ERRORS,
+                expect::FAULTS
+            )
+        );
+        assert_eq!(agg[testdb::PEER_L].faults, 1);
+        assert_eq!(agg[testdb::PEER_J].faults, 0);
+        db.drop_database().await;
+    }
+
+    #[tokio::test]
+    async fn a_deployment_found_nondeterministic_stops_counting_against_indexers() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_rotating_minority(&db.pool, Utc::now() - chrono::Duration::hours(2)).await;
+        let wide = foghorn_core::config::QosRollupConfig {
+            lookback_secs: 3 * 3600,
+            ..Default::default()
+        };
+        crate::qos::rollup_once(&wide, &db.pool).await.unwrap();
+        let divergent = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(sum(divergent_count), 0)::bigint FROM foghorn_qos WHERE deployment_id = $1",
+            )
+            .bind(testdb::ROTATING_DEPLOYMENT)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(divergent(db.pool.clone()).await, 4);
+
+        detect_nondeterministic(&db.pool).await.unwrap();
+        crate::qos::rollup_once(&Default::default(), &db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(divergent(db.pool.clone()).await, 0);
+        db.drop_database().await;
+    }
+
+    async fn divergent_on(pool: &PgPool, deployment: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COALESCE(sum(divergent_count), 0)::bigint FROM foghorn_qos WHERE deployment_id = $1",
+        )
+        .bind(deployment)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refused_payments_and_unattributed_answers_alone_do_not_flag_a_deployment() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        let at = Utc::now() - chrono::Duration::hours(2);
+        testdb::seed_unattributed_rotation(&db.pool, at).await;
+        testdb::seed_rotating_minority(&db.pool, at).await;
+
+        detect_nondeterministic(&db.pool).await.unwrap();
+
+        let flagged: Vec<String> = sqlx::query_scalar(
+            "SELECT deployment_id FROM nondeterministic_deployment ORDER BY deployment_id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(flagged, vec![testdb::ROTATING_DEPLOYMENT.to_string()]);
+        db.drop_database().await;
+    }
+
+    #[tokio::test]
+    async fn a_deployment_leaving_the_nondeterministic_list_counts_divergence_again() {
+        let Some(db) = TestDb::create().await else {
+            return;
+        };
+        testdb::seed_disagreement(&db.pool, Utc::now() - chrono::Duration::hours(2)).await;
+        let wide = foghorn_core::config::QosRollupConfig {
+            lookback_secs: 3 * 3600,
+            ..Default::default()
+        };
+        crate::qos::rollup_once(&wide, &db.pool).await.unwrap();
+        assert_eq!(
+            divergent_on(&db.pool, testdb::NONDETERMINISTIC_DEPLOYMENT).await,
+            0
+        );
+
+        detect_nondeterministic(&db.pool).await.unwrap();
+        crate::qos::rollup_once(&Default::default(), &db.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            divergent_on(&db.pool, testdb::NONDETERMINISTIC_DEPLOYMENT).await,
+            1
+        );
+        db.drop_database().await;
+    }
 }

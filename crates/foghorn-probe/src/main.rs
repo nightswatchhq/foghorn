@@ -42,6 +42,12 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Database connected and migrations applied");
 
+    if std::env::args().nth(1).as_deref() == Some("reroll-qos") {
+        let rows = qos::reroll_all(&config.qos_rollup, &pool).await?;
+        info!(rows, "Every stored QoS bucket recomputed");
+        return Ok(());
+    }
+
     // Lodestar ingest loop — roster / QoS / REO into indexer_profile.
     if let Some(lodestar) = config.lodestar.clone() {
         let pool = pool.clone();
