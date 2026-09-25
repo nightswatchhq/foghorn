@@ -102,6 +102,16 @@ impl LodestarClient {
         }
     }
 
+    /// Any route as JSON, for callers that read only a few fields and would rather not own a type.
+    pub async fn get_json(&self, path: &str) -> Result<serde_json::Value> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self.req(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("{path}: HTTP {}", resp.status()));
+        }
+        Ok(resp.json().await?)
+    }
+
     /// Fetch the full enriched indexer roster.
     pub async fn fetch_enriched(&self) -> Result<Vec<EnrichedIndexer>> {
         let url = format!("{}/api/indexers-enriched", self.base_url);

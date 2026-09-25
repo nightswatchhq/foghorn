@@ -1,3 +1,4 @@
+pub mod alerts;
 pub mod config;
 pub mod deployment;
 pub mod db;

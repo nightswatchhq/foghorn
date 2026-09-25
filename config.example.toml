@@ -27,7 +27,7 @@ stake_grt  = "500000"
 # Lodestar dashboard API — primary source for roster / QoS / REO / stake.
 # Omit this whole section to disable roster/QoS ingest (correctness probing still runs).
 [lodestar]
-base_url             = "https://www.lodestar-dashboard.com"
+base_url             = "https://api.lodestar-dashboard.com"
 # api_key            = "optional-bearer-token"
 ingest_interval_secs = 3600
 

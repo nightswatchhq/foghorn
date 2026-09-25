@@ -1,4 +1,4 @@
-use axum::{routing::get, Router};
+use axum::{routing::{get, post}, Router};
 use foghorn_core::{
     config::load_config,
     db::{create_pool, run_migrations},
@@ -6,6 +6,7 @@ use foghorn_core::{
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
+mod alerts;
 mod graphql;
 mod qos;
 mod routes;
@@ -83,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/qos/graphql",
             get(routes::graphql_playground).post(routes::graphql_handler),
         )
+        // ── Alert subscriptions (lodestar#256) ──
+        .route("/v1/alerts/subscriptions", post(alerts::create))
+        .route("/v1/alerts/subscriptions/:id", get(alerts::get))
+        .route("/v1/alerts/subscriptions/:id/delete", post(alerts::delete))
         .layer(cors)
         .with_state(state);
 

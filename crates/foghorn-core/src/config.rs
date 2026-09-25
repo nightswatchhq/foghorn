@@ -20,7 +20,7 @@ fn default_probe_count() -> u32 {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LodestarConfig {
-    /// Base URL of the Lodestar dashboard API, e.g. "https://www.lodestar-dashboard.com".
+    /// Base URL of the Lodestar dashboard API, e.g. "https://api.lodestar-dashboard.com".
     pub base_url: String,
     /// Optional bearer token, if the deployment gates the API.
     #[serde(default)]
@@ -33,7 +33,7 @@ pub struct LodestarConfig {
 impl Default for LodestarConfig {
     fn default() -> Self {
         Self {
-            base_url: "https://www.lodestar-dashboard.com".to_string(),
+            base_url: "https://api.lodestar-dashboard.com".to_string(),
             api_key: None,
             ingest_interval_secs: default_ingest_interval(),
         }
