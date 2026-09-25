@@ -22,6 +22,7 @@ mod resolver;
 mod scheduler;
 mod scorer;
 mod status;
+mod subscriptions;
 mod sybil;
 
 #[tokio::main]
@@ -55,6 +56,17 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move { ingest::run_ingest_loop(lodestar, api_key, pool).await });
     } else {
         info!("No [lodestar] config — roster/QoS ingest disabled");
+    }
+
+    // Alert subscriptions from Lodestar's indexer page (lodestar#256), read from the same API.
+    if let Some(lodestar) = config.lodestar.clone() {
+        match lodestar::LodestarClient::new(&lodestar.base_url, lodestar.api_key.clone(), 30) {
+            Ok(client) => {
+                let pool = pool.clone();
+                tokio::spawn(async move { subscriptions::run_subscription_loop(client, pool).await });
+            }
+            Err(e) => warn!(error = %e, "Lodestar client could not be built — alert subscriptions disabled"),
+        }
     }
 
     // Direct /status health probing (unauthenticated, no TAP).
